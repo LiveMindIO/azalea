@@ -5,11 +5,11 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt::{self, Debug, Display},
-    io::{self, Cursor},
+    io::{self, Cursor, Write},
     mem::ManuallyDrop,
 };
 
-use azalea_buf::{AzBuf, BufReadError};
+use azalea_buf::{AzBuf, AzBufVar, BufReadError};
 use azalea_chat::FormattedText;
 use azalea_core::{
     attribute_modifier_operation::AttributeModifierOperation,
@@ -34,7 +34,7 @@ use serde::{Serialize, Serializer, ser::SerializeMap};
 use simdnbt::owned::{Nbt, NbtCompound};
 use tracing::trace;
 
-use crate::{ItemStack, item::consume_effect::ConsumeEffect};
+use crate::{ItemStack, ItemStackData, item::consume_effect::ConsumeEffect};
 
 pub trait DataComponentTrait:
     Send + Sync + Any + Clone + Serialize + Into<DataComponentUnion>
@@ -45,8 +45,8 @@ pub trait DataComponentTrait:
 pub trait EncodableDataComponent: Send + Sync + Any + Debug {
     fn encode(&self, buf: &mut Vec<u8>) -> io::Result<()>;
     fn crc_hash(&self, registries: &RegistryHolder) -> Checksum;
-    // using the Clone trait makes it not be object-safe, so we have our own clone
-    // function instead
+    // using the Clone trait makes it not be object-safe, so we have our own
+    // clone function instead
     fn clone(&self) -> Box<dyn EncodableDataComponent>;
     // same thing here
     fn eq(&self, other: &dyn EncodableDataComponent) -> bool;
@@ -661,16 +661,66 @@ pub enum MapPostProcessing {
     Scale,
 }
 
-#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+/// Read a list of stacks in the template wire form
+/// ([`ItemStackData::azalea_read_template`]), which has no encoding for an
+/// empty stack.
+fn read_template_list(buf: &mut Cursor<&[u8]>) -> Result<Vec<ItemStack>, BufReadError> {
+    let length = u32::azalea_read_var(buf)? as usize;
+    let mut items = Vec::with_capacity(usize::min(length, 65536));
+    for _ in 0..length {
+        items.push(ItemStack::from(ItemStackData::azalea_read_template(buf)?));
+    }
+    Ok(items)
+}
+
+/// Write a list of stacks in the template wire form. Empty stacks aren't
+/// representable in it and are skipped (vanilla never puts any in these
+/// lists).
+fn write_template_list(items: &[ItemStack], buf: &mut impl Write) -> io::Result<()> {
+    let present: Vec<&ItemStackData> = items.iter().filter_map(ItemStack::as_present).collect();
+    (present.len() as u32).azalea_write_var(buf)?;
+    for item in present {
+        item.azalea_write_template(buf)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct ChargedProjectiles {
     pub items: Vec<ItemStack>,
 }
 
-#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+// the stacks nested inside this component (and `bundle_contents`,
+// `container`, and `use_remainder`) are encoded as vanilla's
+// `ItemStackTemplate` — item id, then count, then patch — not the count-first
+// codec top-level slots use
+impl AzBuf for ChargedProjectiles {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(ChargedProjectiles {
+            items: read_template_list(buf)?,
+        })
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        write_template_list(&self.items, buf)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct BundleContents {
     pub items: Vec<ItemStack>,
+}
+
+impl AzBuf for BundleContents {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(BundleContents {
+            items: read_template_list(buf)?,
+        })
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        write_template_list(&self.items, buf)
+    }
 }
 
 #[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
@@ -903,10 +953,40 @@ pub struct PotDecorations {
     pub items: Vec<ItemKind>,
 }
 
-#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct Container {
     pub items: Vec<ItemStack>,
+}
+
+// like the other template-form components, but each entry gets a presence
+// bool first so empty slots are representable
+impl AzBuf for Container {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        let length = u32::azalea_read_var(buf)? as usize;
+        let mut items = Vec::with_capacity(usize::min(length, 65536));
+        for _ in 0..length {
+            items.push(if bool::azalea_read(buf)? {
+                ItemStack::from(ItemStackData::azalea_read_template(buf)?)
+            } else {
+                ItemStack::Empty
+            });
+        }
+        Ok(Container { items })
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        (self.items.len() as u32).azalea_write_var(buf)?;
+        for item in &self.items {
+            match item.as_present() {
+                Some(data) => {
+                    true.azalea_write(buf)?;
+                    data.azalea_write_template(buf)?;
+                }
+                None => false.azalea_write(buf)?,
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
@@ -1009,10 +1089,21 @@ pub enum ItemUseAnimation {
     Brush,
 }
 
-#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct UseRemainder {
     pub convert_into: ItemStack,
+}
+
+impl AzBuf for UseRemainder {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(UseRemainder {
+            convert_into: ItemStack::azalea_read_template(buf)?,
+        })
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        self.convert_into.azalea_write_template(buf)
+    }
 }
 
 #[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
@@ -1924,8 +2015,42 @@ pub struct CatSoundVariant {
     pub value: azalea_registry::data::CatSoundVariant,
 }
 
-#[derive(Clone, PartialEq, AzBuf, Debug, Serialize)]
+#[derive(Clone, PartialEq, Debug, Serialize)]
 #[serde(transparent)]
 pub struct SulfurCubeContent {
     pub absorbed_block_item_stack: ItemStack,
+}
+
+impl AzBuf for SulfurCubeContent {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(Self {
+            absorbed_block_item_stack: ItemStack::azalea_read_template(buf)?,
+        })
+    }
+
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        self.absorbed_block_item_stack.azalea_write_template(buf)
+    }
+}
+
+#[cfg(test)]
+mod sulfur_cube_content_tests {
+    use super::*;
+
+    #[test]
+    fn absorbed_stack_uses_the_template_codec() {
+        let stack = ItemStack::new(ItemKind::Stone, 3);
+        let component = SulfurCubeContent {
+            absorbed_block_item_stack: stack.clone(),
+        };
+        let mut actual = Vec::new();
+        component.azalea_write(&mut actual).unwrap();
+        let mut expected = Vec::new();
+        stack.azalea_write_template(&mut expected).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            SulfurCubeContent::azalea_read(&mut Cursor::new(&actual)).unwrap(),
+            component
+        );
+    }
 }

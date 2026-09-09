@@ -14,6 +14,7 @@ is breaking anyways, semantic versioning is not followed.
 - `azalea-chat` is now re-exported in `azalea::chat`.
 - Shape offsets were implemented, so bots no longer get stuck on bamboo and dripstone.
 - Added the `TokioRuntimeHandle` resource to allow spawning Tokio tasks in the ECS again.
+- Added recipe-book state and `Client::recipe_for`, `Client::craft`, and `Client::open_crafting_table` APIs.
 
 ### Changed
 
@@ -24,6 +25,9 @@ is breaking anyways, semantic versioning is not followed.
 
 - Incorrect `damage_kind` component protocol implementation.
 - The `AirSupply` metadata component was defaulting to `0` instead of `300`. (@wbbradley)
+- Recipe display IDs and optional groups now use their Minecraft 26.2 wire formats.
+- Server inventory corrections now update cursor, player slots, menu state IDs, and open-container projections.
+- Fixed nested item-stack codecs and several click-prediction bugs affecting crafting and quick moves.
 
 ## [0.16.0+mc26.1] - 2026-03-27
 

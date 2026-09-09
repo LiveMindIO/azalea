@@ -1,5 +1,7 @@
+use std::io::{self, Cursor, Write};
+
 use azalea_block::BlockState;
-use azalea_buf::AzBuf;
+use azalea_buf::{AzBuf, BufReadError};
 use azalea_core::{color::RgbColor, entity_id::MinecraftEntityId, position::BlockPos};
 use azalea_inventory::ItemStack;
 use azalea_registry::builtin::ParticleKind;
@@ -308,9 +310,22 @@ pub struct ColorParticle {
     pub color: RgbColor,
 }
 
-#[derive(AzBuf, Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ItemParticle {
     pub item: ItemStack,
+}
+
+// vanilla's ItemParticleOption carries the stack in the template wire form
+// (item id, count, patch), not the count-first codec inventory slots use
+impl AzBuf for ItemParticle {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(ItemParticle {
+            item: ItemStack::azalea_read_template(buf)?,
+        })
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        self.item.azalea_write_template(buf)
+    }
 }
 
 #[derive(AzBuf, Clone, Debug, Default, PartialEq)]

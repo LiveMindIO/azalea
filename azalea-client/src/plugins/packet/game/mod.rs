@@ -16,6 +16,7 @@ use azalea_entity::{
     inventory::Inventory,
     metadata::{Health, apply_metadata},
 };
+use azalea_inventory::ItemStack;
 use azalea_protocol::{
     common::movements::MoveFlags,
     packets::{
@@ -38,7 +39,10 @@ use crate::{
     cookies::{RequestCookieEvent, StoreCookieEvent},
     disconnect::DisconnectEvent,
     interact::BlockStatePredictionHandler,
-    inventory::{ClientsideCloseContainerEvent, MenuOpenedEvent, SetContainerContentEvent},
+    inventory::{
+        ClientsideCloseContainerEvent, GhostRecipe, InventorySyncState, MenuOpenedEvent,
+        RecipeBook, SetContainerContentEvent,
+    },
     local_player::{Experience, Hunger, PreviousGameMode, TabList, TabListResource, WorldHolder},
     movement::{KnockbackData, KnockbackEvent},
     packet::{
@@ -265,7 +269,8 @@ impl GamePacketHandler<'_> {
                         return;
                     };
 
-                    // add this world to the `worlds` (or don't, if it's already there)
+                    // add this world to the `worlds` (or don't, if it's already
+                    // there)
                     weak_world = worlds.get_or_insert(
                         new_world_name.clone(),
                         dimension_data.height,
@@ -279,8 +284,8 @@ impl GamePacketHandler<'_> {
                     });
                 }
 
-                // set the partial world to an empty world (when we add chunks or entities those
-                // will be in the `worlds`)
+                // set the partial world to an empty world (when we add chunks
+                // or entities those will be in the `worlds`)
 
                 *world_holder.partial.write() = PartialWorld::new(
                     azalea_world::chunk::calculate_chunk_storage_range(
@@ -345,8 +350,8 @@ impl GamePacketHandler<'_> {
     }
 
     pub fn chunk_batch_start(&mut self, _p: &ClientboundChunkBatchStart) {
-        // the packet is empty, it's just a marker to tell us when the batch starts and
-        // ends
+        // the packet is empty, it's just a marker to tell us when the batch
+        // starts and ends
         debug!("Got chunk batch start");
 
         as_system::<MessageWriter<_>>(self.ecs, |mut events| {
@@ -391,6 +396,15 @@ impl GamePacketHandler<'_> {
 
     pub fn set_cursor_item(&mut self, p: &ClientboundSetCursorItem) {
         debug!("Got set cursor item packet {p:?}");
+
+        // this is how the server corrects a carried stack the client's own
+        // click prediction got wrong (since 1.21.2; before that it was
+        // container_set_slot with container id -1)
+        as_system::<Query<(&mut Inventory, &mut InventorySyncState)>>(self.ecs, |mut query| {
+            let (mut inventory, mut sync_state) = query.get_mut(self.player).unwrap();
+            inventory.carried = p.contents.clone();
+            sync_state.authoritative_revision = sync_state.authoritative_revision.wrapping_add(1);
+        });
     }
 
     pub fn update_tags(&mut self, _p: &ClientboundUpdateTags) {
@@ -408,8 +422,15 @@ impl GamePacketHandler<'_> {
         });
     }
 
-    pub fn update_recipes(&mut self, _p: &ClientboundUpdateRecipes) {
+    pub fn update_recipes(&mut self, p: &ClientboundUpdateRecipes) {
         debug!("Got update recipes packet");
+
+        as_system::<Query<&mut RecipeBook>>(self.ecs, |mut query| {
+            query
+                .get_mut(self.player)
+                .unwrap()
+                .replace_recipe_data(p.item_sets.clone(), p.stonecutter_recipes.clone());
+        });
     }
 
     pub fn entity_event(&mut self, _p: &ClientboundEntityEvent) {
@@ -593,13 +614,15 @@ impl GamePacketHandler<'_> {
                     return;
                 };
 
-                // check if the entity already exists, and if it does then only add to LoadedBy
+                // check if the entity already exists, and if it does then only
+                // add to LoadedBy
                 let world = worlds.get(world_name).unwrap();
                 if let Some(&ecs_entity) = world.read().entity_by_id.get(&entity_id) {
                     // entity already exists
                     let Ok(mut loaded_by) = loaded_by_query.get_mut(ecs_entity) else {
-                        // LoadedBy for this entity isn't in the ecs! figure out what went wrong
-                        // and print an error
+                        // LoadedBy for this entity isn't in the ecs! figure out
+                        // what went wrong and print an
+                        // error
 
                         let entity_in_ecs = entity_query.get(ecs_entity).is_ok();
 
@@ -645,16 +668,17 @@ impl GamePacketHandler<'_> {
 
                 // add the GameProfileComponent if the uuid is in the tab list
                 if let Some(tab_list) = tab_list {
-                    // (technically this makes it possible for non-player entities to have
-                    // GameProfileComponents but the server would have to be doing something
-                    // really weird)
+                    // (technically this makes it possible for non-player
+                    // entities to have
+                    // GameProfileComponents but the server would have to be
+                    // doing something really weird)
                     if let Some(player_info) = tab_list.get(&p.uuid) {
                         spawned.insert(GameProfileComponent(player_info.profile.clone()));
                     }
                 }
 
-                // the bundle doesn't include the default entity metadata so we add that
-                // separately
+                // the bundle doesn't include the default entity metadata so we
+                // add that separately
                 p.apply_metadata(&mut spawned);
             },
         );
@@ -694,8 +718,8 @@ impl GamePacketHandler<'_> {
 
             let packed_items = p.packed_items.clone().to_vec();
 
-            // we use RelativeEntityUpdate because it makes sure changes aren't made
-            // multiple times
+            // we use RelativeEntityUpdate because it makes sure changes aren't
+            // made multiple times
             commands.entity(entity).queue(RelativeEntityUpdate::new(
                 world_holder.partial.clone(),
                 move |entity| {
@@ -720,8 +744,9 @@ impl GamePacketHandler<'_> {
     }
 
     pub fn set_entity_motion(&mut self, p: &ClientboundSetEntityMotion) {
-        // vanilla servers use this packet for knockback, but note that the Explode
-        // packet is also sometimes used by servers for knockback
+        // vanilla servers use this packet for knockback, but note that the
+        // Explode packet is also sometimes used by servers for
+        // knockback
 
         as_system::<(
             Commands,
@@ -731,8 +756,9 @@ impl GamePacketHandler<'_> {
             let (entity_id_index, world_holder) = query.get(self.player).unwrap();
 
             let Some(entity) = entity_id_index.get_by_minecraft_entity(p.id) else {
-                // note that this log (and some other ones like the one in RemoveEntities)
-                // sometimes happens when killing mobs. it seems to be a vanilla bug, which is
+                // note that this log (and some other ones like the one in
+                // RemoveEntities) sometimes happens when
+                // killing mobs. it seems to be a vanilla bug, which is
                 // why it's a debug log instead of a warning
                 debug!(
                     "Got set entity motion packet for unknown entity id {}",
@@ -743,8 +769,8 @@ impl GamePacketHandler<'_> {
 
             let data = KnockbackData::Set(p.delta.to_vec3());
 
-            // this is to make sure the same entity velocity update doesn't get sent
-            // multiple times when in swarms
+            // this is to make sure the same entity velocity update doesn't get
+            // sent multiple times when in swarms
             if should_apply_entity_update(
                 &mut commands,
                 &mut world_holder.partial.write(),
@@ -830,7 +856,8 @@ impl GamePacketHandler<'_> {
                                 &mut look_direction,
                                 &mut physics,
                             );
-                            // old_pos is set to the current position when we're teleported
+                            // old_pos is set to the current position when we're
+                            // teleported
                             physics.set_old_pos(old_position);
                         });
                     },
@@ -961,11 +988,13 @@ impl GamePacketHandler<'_> {
                         continue;
                     };
 
-                    // the `remove_despawned_entities_from_indexes` system will despawn the entity
-                    // if it's not loaded by anything anymore
+                    // the `remove_despawned_entities_from_indexes` system will
+                    // despawn the entity if it's not loaded
+                    // by anything anymore
 
-                    // also we can't just ecs.despawn because if we're in a swarm then the entity
-                    // might still be loaded by another client
+                    // also we can't just ecs.despawn because if we're in a
+                    // swarm then the entity might still be
+                    // loaded by another client
 
                     loaded_by.remove(&self.player);
                 }
@@ -1130,25 +1159,41 @@ impl GamePacketHandler<'_> {
     pub fn container_set_content(&mut self, p: &ClientboundContainerSetContent) {
         debug!("Got container set content packet {p:?}");
 
-        as_system::<(Commands, Query<&mut Inventory>)>(self.ecs, |(mut commands, mut query)| {
-            let mut inventory = query.get_mut(self.player).unwrap();
+        as_system::<(Commands, Query<(&mut Inventory, &mut InventorySyncState)>)>(
+            self.ecs,
+            |(mut commands, mut query)| {
+                let (mut inventory, mut sync_state) = query.get_mut(self.player).unwrap();
 
-            // container id 0 is always the player's inventory
-            if p.container_id == 0 {
-                // this is just so it has the same type as the `else` block
-                for (i, slot) in p.items.iter().enumerate() {
-                    if let Some(slot_mut) = inventory.inventory_menu.slot_mut(i) {
-                        *slot_mut = slot.clone();
+                // container id 0 is always the player's inventory
+                if p.container_id == 0 {
+                    let menu_len = inventory.inventory_menu.slots().len();
+                    for i in 0..menu_len {
+                        inventory.set_player_menu_slot(
+                            i,
+                            p.items.get(i).cloned().unwrap_or(ItemStack::Empty),
+                        );
                     }
+                    sync_state.player_state_id = p.state_id;
+                    if inventory.id == 0 {
+                        inventory.carried = p.carried_item.clone();
+                        inventory.state_id = p.state_id;
+                        sync_state.initialized_container_id = Some(0);
+                        sync_state.full_content_revision =
+                            sync_state.full_content_revision.wrapping_add(1);
+                    }
+                    sync_state.authoritative_revision =
+                        sync_state.authoritative_revision.wrapping_add(1);
+                } else {
+                    commands.trigger(SetContainerContentEvent {
+                        entity: self.player,
+                        slots: p.items.clone(),
+                        container_id: p.container_id,
+                        carried_item: p.carried_item.clone(),
+                        state_id: p.state_id,
+                    });
                 }
-            } else {
-                commands.trigger(SetContainerContentEvent {
-                    entity: self.player,
-                    slots: p.items.clone(),
-                    container_id: p.container_id,
-                });
-            }
-        });
+            },
+        );
     }
 
     pub fn container_set_data(&mut self, p: &ClientboundContainerSetData) {
@@ -1167,42 +1212,36 @@ impl GamePacketHandler<'_> {
     pub fn container_set_slot(&mut self, p: &ClientboundContainerSetSlot) {
         debug!("Got container set slot packet {p:?}");
 
-        as_system::<Query<&mut Inventory>>(self.ecs, |mut query| {
-            let mut inventory = query.get_mut(self.player).unwrap();
+        as_system::<Query<(&mut Inventory, &mut InventorySyncState)>>(self.ecs, |mut query| {
+            let (mut inventory, mut sync_state) = query.get_mut(self.player).unwrap();
+            let slot_index = usize::from(p.slot);
 
-            if p.container_id == -1 {
-                // -1 means carried item
-                inventory.carried = p.item_stack.clone();
-            } else if p.container_id == -2 {
-                if let Some(slot) = inventory.inventory_menu.slot_mut(p.slot.into()) {
-                    *slot = p.item_stack.clone();
-                }
-            } else {
-                let is_creative_mode_and_inventory_closed = false;
-                // technically minecraft has slightly different behavior here if you're in
-                // creative mode and have your inventory open
-                if p.container_id == 0 && azalea_inventory::Player::is_hotbar_slot(p.slot.into()) {
-                    // minecraft also sets a "pop time" here which is used for an animation
-                    // but that's not really necessary
-                    if let Some(slot) = inventory.inventory_menu.slot_mut(p.slot.into()) {
-                        *slot = p.item_stack.clone();
-                    }
-                } else if p.container_id == inventory.id
-                    && (p.container_id != 0 || !is_creative_mode_and_inventory_closed)
-                {
-                    // var2.containerMenu.setItem(var4, var1.getStateId(), var3);
-                    if let Some(slot) = inventory.menu_mut().slot_mut(p.slot.into()) {
-                        *slot = p.item_stack.clone();
+            if p.container_id == 0 {
+                if inventory.inventory_menu.slot(slot_index).is_some() {
+                    inventory.set_player_menu_slot(slot_index, p.item_stack.clone());
+                    sync_state.player_state_id = p.state_id;
+                    if inventory.id == 0 {
                         inventory.state_id = p.state_id;
                     }
+                    sync_state.authoritative_revision =
+                        sync_state.authoritative_revision.wrapping_add(1);
                 }
+            } else if p.container_id == inventory.id
+                && sync_state.is_initialized(p.container_id)
+                && let Some(slot) = inventory.menu_mut().slot_mut(slot_index)
+            {
+                *slot = p.item_stack.clone();
+                inventory.state_id = p.state_id;
+                inventory.sync_player_slots_from_container();
+                sync_state.authoritative_revision =
+                    sync_state.authoritative_revision.wrapping_add(1);
             }
         });
     }
 
     pub fn container_close(&mut self, p: &ClientboundContainerClose) {
-        // there's a container_id field in the packet, but minecraft doesn't actually
-        // check it
+        // there's a container_id field in the packet, but minecraft doesn't
+        // actually check it
 
         debug!("Got container close packet {p:?}");
 
@@ -1280,7 +1319,17 @@ impl GamePacketHandler<'_> {
         });
     }
 
-    pub fn place_ghost_recipe(&mut self, _p: &ClientboundPlaceGhostRecipe) {}
+    pub fn place_ghost_recipe(&mut self, p: &ClientboundPlaceGhostRecipe) {
+        as_system::<Query<(&Inventory, &mut RecipeBook)>>(self.ecs, |mut query| {
+            let (inventory, mut recipe_book) = query.get_mut(self.player).unwrap();
+            if inventory.id == p.container_id {
+                recipe_book.set_ghost_recipe(GhostRecipe {
+                    container_id: p.container_id,
+                    recipe: p.recipe.clone(),
+                });
+            }
+        });
+    }
 
     pub fn player_combat_end(&mut self, _p: &ClientboundPlayerCombatEnd) {}
 
@@ -1403,7 +1452,8 @@ impl GamePacketHandler<'_> {
                         return;
                     };
 
-                    // add this world to the `worlds` (or don't if it's already there)
+                    // add this world to the `worlds` (or don't if it's already
+                    // there)
                     weak_world = worlds.get_or_insert(
                         new_world_name.clone(),
                         dimension_data.height,
@@ -1417,8 +1467,8 @@ impl GamePacketHandler<'_> {
                     });
                 }
 
-                // set the partial world to an empty world (when we add chunks or entities,
-                // those will be in the `worlds`)
+                // set the partial world to an empty world (when we add chunks
+                // or entities, those will be in the `worlds`)
 
                 *world_holder.partial.write() = PartialWorld::new(
                     azalea_world::chunk::calculate_chunk_storage_range(
@@ -1607,14 +1657,45 @@ impl GamePacketHandler<'_> {
             }
         });
     }
-    pub fn set_player_inventory(&mut self, _p: &ClientboundSetPlayerInventory) {}
+    pub fn set_player_inventory(&mut self, p: &ClientboundSetPlayerInventory) {
+        debug!("Got set player inventory packet {p:?}");
+
+        // a direct player-inventory write, addressed by vanilla Inventory
+        // index; the server uses it for changes that happen outside the open
+        // menu's click flow (item pickups while a container is open, etc.)
+        as_system::<Query<(&mut Inventory, &mut InventorySyncState)>>(self.ecs, |mut query| {
+            let (mut inventory, mut sync_state) = query.get_mut(self.player).unwrap();
+            inventory.set_player_inventory_slot(p.slot, p.contents.clone());
+            sync_state.authoritative_revision = sync_state.authoritative_revision.wrapping_add(1);
+        });
+    }
     pub fn projectile_power(&mut self, _p: &ClientboundProjectilePower) {}
     pub fn custom_report_details(&mut self, _p: &ClientboundCustomReportDetails) {}
     pub fn server_links(&mut self, _p: &ClientboundServerLinks) {}
     pub fn player_rotation(&mut self, _p: &ClientboundPlayerRotation) {}
-    pub fn recipe_book_add(&mut self, _p: &ClientboundRecipeBookAdd) {}
-    pub fn recipe_book_remove(&mut self, _p: &ClientboundRecipeBookRemove) {}
-    pub fn recipe_book_settings(&mut self, _p: &ClientboundRecipeBookSettings) {}
+    pub fn recipe_book_add(&mut self, p: &ClientboundRecipeBookAdd) {
+        as_system::<Query<&mut RecipeBook>>(self.ecs, |mut query| {
+            query.get_mut(self.player).unwrap().add(
+                p.entries
+                    .iter()
+                    .map(|entry| (entry.contents.clone(), entry.flags)),
+                p.replace,
+            );
+        });
+    }
+    pub fn recipe_book_remove(&mut self, p: &ClientboundRecipeBookRemove) {
+        as_system::<Query<&mut RecipeBook>>(self.ecs, |mut query| {
+            query.get_mut(self.player).unwrap().remove(&p.recipes);
+        });
+    }
+    pub fn recipe_book_settings(&mut self, p: &ClientboundRecipeBookSettings) {
+        as_system::<Query<&mut RecipeBook>>(self.ecs, |mut query| {
+            query
+                .get_mut(self.player)
+                .unwrap()
+                .set_settings(p.book_settings.clone());
+        });
+    }
     pub fn test_instance_block_status(&mut self, _p: &ClientboundTestInstanceBlockStatus) {}
     pub fn waypoint(&mut self, _p: &ClientboundWaypoint) {}
 

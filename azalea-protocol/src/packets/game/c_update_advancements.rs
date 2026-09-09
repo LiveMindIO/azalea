@@ -44,7 +44,8 @@ impl AzBuf for DisplayInfo {
     fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, azalea_buf::BufReadError> {
         let title = AzBuf::azalea_read(buf)?;
         let description = AzBuf::azalea_read(buf)?;
-        let icon = AzBuf::azalea_read(buf)?;
+        // the icon is a nested stack, so it uses the template wire form
+        let icon = ItemStack::azalea_read_template(buf)?;
         let frame = AzBuf::azalea_read(buf)?;
 
         let data = u32::azalea_read(buf)?;
@@ -74,7 +75,7 @@ impl AzBuf for DisplayInfo {
     fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
         self.title.azalea_write(buf)?;
         self.description.azalea_write(buf)?;
-        self.icon.azalea_write(buf)?;
+        self.icon.azalea_write_template(buf)?;
         self.frame.azalea_write(buf)?;
 
         let mut data: u32 = 0;

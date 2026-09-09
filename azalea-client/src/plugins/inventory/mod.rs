@@ -1,13 +1,17 @@
 pub mod equipment_effects;
+pub mod recipe_book;
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use azalea_chat::FormattedText;
 use azalea_core::tick::GameTick;
 use azalea_entity::{PlayerAbilities, inventory::Inventory as Inv};
-use azalea_inventory::operations::ClickOperation;
+use azalea_inventory::operations::{ClickOperation, QuickCraftStatusKind};
 pub use azalea_inventory::*;
 use azalea_protocol::packets::game::{
     s_container_click::{HashedStack, ServerboundContainerClick},
     s_container_close::ServerboundContainerClose,
+    s_place_recipe::ServerboundPlaceRecipe,
     s_set_carried_item::ServerboundSetCarriedItem,
 };
 use azalea_registry::builtin::MenuKind;
@@ -15,6 +19,7 @@ use azalea_world::{WorldName, Worlds};
 use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::*;
 use indexmap::IndexMap;
+pub use recipe_book::{GhostRecipe, Recipe, RecipeBook};
 use tracing::{error, warn};
 
 use crate::{
@@ -45,10 +50,52 @@ impl Plugin for InventoryPlugin {
         .add_observer(handle_container_close_event)
         .add_observer(handle_set_container_content_trigger)
         .add_observer(handle_container_click_event)
+        .add_observer(handle_confirmed_container_click_event)
+        .add_observer(handle_place_recipe_event)
         // number keys are checked on tick but scrolling can happen outside of ticks, therefore
         // this is fine
         .add_observer(handle_set_selected_hotbar_slot_event)
         .add_observer(handle_equipment_changes);
+    }
+}
+
+#[derive(Clone, Debug, Component)]
+pub struct InventorySyncState {
+    pub(crate) authoritative_revision: u64,
+    pub(crate) full_content_revision: u64,
+    pub(crate) menu_generation: u64,
+    pub(crate) player_state_id: u32,
+    pub(crate) initialized_container_id: Option<i32>,
+}
+
+impl InventorySyncState {
+    pub fn authoritative_revision(&self) -> u64 {
+        self.authoritative_revision
+    }
+
+    pub fn full_content_revision(&self) -> u64 {
+        self.full_content_revision
+    }
+
+    pub fn menu_generation(&self) -> u64 {
+        self.menu_generation
+    }
+
+    pub fn is_initialized(&self, container_id: i32) -> bool {
+        self.initialized_container_id == Some(container_id)
+    }
+}
+
+impl Default for InventorySyncState {
+    fn default() -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        Self {
+            authoritative_revision: 0,
+            full_content_revision: 0,
+            menu_generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            player_state_id: 0,
+            initialized_container_id: Some(0),
+        }
     }
 }
 
@@ -68,11 +115,19 @@ pub struct MenuOpenedEvent {
     pub menu_type: MenuKind,
     pub title: FormattedText,
 }
-fn handle_menu_opened_trigger(event: On<MenuOpenedEvent>, mut query: Query<&mut Inv>) {
-    let mut inventory = query.get_mut(event.entity).unwrap();
+fn handle_menu_opened_trigger(
+    event: On<MenuOpenedEvent>,
+    mut query: Query<(&mut Inv, &mut InventorySyncState)>,
+) {
+    let (mut inventory, mut sync_state) = query.get_mut(event.entity).unwrap();
     inventory.id = event.window_id;
     inventory.container_menu = Some(Menu::from_kind(event.menu_type));
     inventory.container_menu_title = Some(event.title.clone());
+    inventory.state_id = 0;
+    inventory.quick_craft_status = QuickCraftStatusKind::Start;
+    inventory.quick_craft_slots.clear();
+    sync_state.menu_generation = sync_state.menu_generation.wrapping_add(1);
+    sync_state.initialized_container_id = None;
 }
 
 /// Tell the server that we want to close a container.
@@ -127,27 +182,29 @@ pub struct ClientsideCloseContainerEvent {
 }
 pub fn handle_client_side_close_container_trigger(
     event: On<ClientsideCloseContainerEvent>,
-    mut query: Query<&mut Inv>,
+    mut query: Query<(&mut Inv, &mut InventorySyncState)>,
 ) {
-    let mut inventory = query.get_mut(event.entity).unwrap();
+    let (mut inventory, mut sync_state) = query.get_mut(event.entity).unwrap();
 
     // copy the Player part of the container_menu to the inventory_menu
     if let Some(inventory_menu) = inventory.container_menu.take() {
-        // this isn't the same as what vanilla does. i believe vanilla synchronizes the
-        // slots between inventoryMenu and containerMenu by just having the player slots
-        // point to the same ItemStack in memory, but emulating this in rust would
-        // require us to wrap our `ItemStack`s as `Arc<Mutex<ItemStack>>` which would
-        // have kinda terrible ergonomics.
+        // this isn't the same as what vanilla does. i believe vanilla
+        // synchronizes the slots between inventoryMenu and
+        // containerMenu by just having the player slots point to the
+        // same ItemStack in memory, but emulating this in rust would
+        // require us to wrap our `ItemStack`s as `Arc<Mutex<ItemStack>>` which
+        // would have kinda terrible ergonomics.
 
-        // the simpler solution i chose to go with here is to only copy the player slots
-        // when the container is closed. this is perfectly fine for vanilla, but it
-        // might cause issues if a server modifies id 0 while we have a container
-        // open...
+        // the simpler solution i chose to go with here is to only copy the
+        // player slots when the container is closed. this is perfectly
+        // fine for vanilla, but it might cause issues if a server
+        // modifies id 0 while we have a container open...
 
-        // if we do encounter this issue in the wild then the simplest solution would
-        // probably be to just add logic for updating the container_menu when the server
-        // tries to modify id 0 for slots within `inventory`. not implemented for now
-        // because i'm not sure if that's worth worrying about.
+        // if we do encounter this issue in the wild then the simplest solution
+        // would probably be to just add logic for updating the
+        // container_menu when the server tries to modify id 0 for slots
+        // within `inventory`. not implemented for now because i'm not
+        // sure if that's worth worrying about.
 
         let new_inventory = inventory_menu.slots()[inventory_menu.player_slots_range()].to_vec();
         let new_inventory = <[ItemStack; 36]>::try_from(new_inventory).unwrap();
@@ -156,6 +213,11 @@ pub fn handle_client_side_close_container_trigger(
 
     inventory.id = 0;
     inventory.container_menu_title = None;
+    inventory.state_id = sync_state.player_state_id;
+    inventory.quick_craft_status = QuickCraftStatusKind::Start;
+    inventory.quick_craft_slots.clear();
+    sync_state.menu_generation = sync_state.menu_generation.wrapping_add(1);
+    sync_state.initialized_container_id = Some(0);
 }
 
 #[derive(Debug, EntityEvent)]
@@ -163,6 +225,52 @@ pub struct ContainerClickEvent {
     pub entity: Entity,
     pub window_id: i32,
     pub operation: ClickOperation,
+}
+
+/// A container click that deliberately uses a stale state ID so vanilla sends
+/// a full authoritative container snapshot after executing it.
+#[derive(Debug, EntityEvent)]
+pub struct ConfirmedContainerClickEvent {
+    pub entity: Entity,
+    pub window_id: i32,
+    pub menu_generation: u64,
+    pub operation: ClickOperation,
+}
+
+#[derive(Debug, EntityEvent)]
+pub struct PlaceRecipeEvent {
+    pub entity: Entity,
+    pub container_id: i32,
+    pub menu_generation: u64,
+    pub recipe: Recipe,
+    pub use_max_items: bool,
+}
+
+pub fn handle_place_recipe_event(
+    place_recipe: On<PlaceRecipeEvent>,
+    mut commands: Commands,
+    query: Query<(&Inv, &InventorySyncState, &RecipeBook)>,
+) {
+    let Ok((inventory, sync_state, recipe_book)) = query.get(place_recipe.entity) else {
+        return;
+    };
+    if inventory.id != place_recipe.container_id
+        || sync_state.menu_generation() != place_recipe.menu_generation
+        || !sync_state.is_initialized(place_recipe.container_id)
+        || !recipe_book.contains(&place_recipe.recipe)
+    {
+        warn!("Tried to place a stale recipe or place it in a stale container");
+        return;
+    }
+
+    commands.trigger(SendGamePacketEvent::new(
+        place_recipe.entity,
+        ServerboundPlaceRecipe {
+            container_id: place_recipe.container_id,
+            recipe: place_recipe.recipe.id(),
+            shift_down: place_recipe.use_max_items,
+        },
+    ));
 }
 pub fn handle_container_click_event(
     container_click: On<ContainerClickEvent>,
@@ -172,10 +280,65 @@ pub fn handle_container_click_event(
 ) {
     let (entity, mut inventory, player_abilities, world_name) =
         query.get_mut(container_click.entity).unwrap();
-    if inventory.id != container_click.window_id {
+    send_container_click(
+        entity,
+        container_click.window_id,
+        &container_click.operation,
+        false,
+        &mut commands,
+        &mut inventory,
+        player_abilities,
+        world_name,
+        &worlds,
+    );
+}
+
+pub fn handle_confirmed_container_click_event(
+    container_click: On<ConfirmedContainerClickEvent>,
+    mut commands: Commands,
+    mut query: Query<(
+        Entity,
+        &mut Inv,
+        &InventorySyncState,
+        Option<&PlayerAbilities>,
+        &WorldName,
+    )>,
+    worlds: Res<Worlds>,
+) {
+    let (entity, mut inventory, sync_state, player_abilities, world_name) =
+        query.get_mut(container_click.entity).unwrap();
+    if sync_state.menu_generation() != container_click.menu_generation {
+        return;
+    }
+    send_container_click(
+        entity,
+        container_click.window_id,
+        &container_click.operation,
+        true,
+        &mut commands,
+        &mut inventory,
+        player_abilities,
+        world_name,
+        &worlds,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_container_click(
+    entity: Entity,
+    window_id: i32,
+    operation: &ClickOperation,
+    force_resync: bool,
+    commands: &mut Commands,
+    inventory: &mut Inv,
+    player_abilities: Option<&PlayerAbilities>,
+    world_name: &WorldName,
+    worlds: &Worlds,
+) {
+    if inventory.id != window_id {
         error!(
             "Tried to click container with ID {}, but the current container ID is {}. Click packet won't be sent.",
-            container_click.window_id, inventory.id
+            window_id, inventory.id
         );
         return;
     }
@@ -186,7 +349,7 @@ pub fn handle_container_click_event(
 
     let old_slots = inventory.menu().slots();
     inventory.simulate_click(
-        &container_click.operation,
+        operation,
         player_abilities.unwrap_or(&PlayerAbilities::default()),
     );
     let new_slots = inventory.menu().slots();
@@ -209,15 +372,15 @@ pub fn handle_container_click_event(
     commands.trigger(SendGamePacketEvent::new(
         entity,
         ServerboundContainerClick {
-            container_id: container_click.window_id,
-            state_id: inventory.state_id,
-            slot_num: container_click
-                .operation
-                .slot_num()
-                .map(|n| n as i16)
-                .unwrap_or(-999),
-            button_num: container_click.operation.button_num(),
-            click_type: container_click.operation.click_type(),
+            container_id: window_id,
+            state_id: if force_resync {
+                inventory.state_id ^ 0x4000
+            } else {
+                inventory.state_id
+            },
+            slot_num: operation.slot_num().map(|n| n as i16).unwrap_or(-999),
+            button_num: operation.button_num(),
+            click_type: operation.click_type(),
             changed_slots,
             carried_item: HashedStack::from_item_stack(&inventory.carried, registry_holder),
         },
@@ -232,12 +395,14 @@ pub struct SetContainerContentEvent {
     pub entity: Entity,
     pub slots: Vec<ItemStack>,
     pub container_id: i32,
+    pub carried_item: ItemStack,
+    pub state_id: u32,
 }
 pub fn handle_set_container_content_trigger(
     set_container_content: On<SetContainerContentEvent>,
-    mut query: Query<&mut Inv>,
+    mut query: Query<(&mut Inv, &mut InventorySyncState)>,
 ) {
-    let mut inventory = query.get_mut(set_container_content.entity).unwrap();
+    let (mut inventory, mut sync_state) = query.get_mut(set_container_content.entity).unwrap();
 
     if set_container_content.container_id != inventory.id {
         warn!(
@@ -248,11 +413,21 @@ pub fn handle_set_container_content_trigger(
     }
 
     let menu = inventory.menu_mut();
-    for (i, slot) in set_container_content.slots.iter().enumerate() {
-        if let Some(slot_mut) = menu.slot_mut(i) {
-            *slot_mut = slot.clone();
-        }
+    let menu_len = menu.slots().len();
+    for i in 0..menu_len {
+        *menu.slot_mut(i).unwrap() = set_container_content
+            .slots
+            .get(i)
+            .cloned()
+            .unwrap_or(ItemStack::Empty);
     }
+    // vanilla's initializeContents also takes the carried item and state id
+    inventory.carried = set_container_content.carried_item.clone();
+    inventory.state_id = set_container_content.state_id;
+    inventory.sync_player_slots_from_container();
+    sync_state.authoritative_revision = sync_state.authoritative_revision.wrapping_add(1);
+    sync_state.full_content_revision = sync_state.full_content_revision.wrapping_add(1);
+    sync_state.initialized_container_id = Some(set_container_content.container_id);
 }
 
 /// An ECS message to switch our hand to a different hotbar slot.
@@ -305,5 +480,18 @@ pub fn ensure_has_sent_carried_item(
         commands.entity(entity).insert(LastSentSelectedHotbarSlot {
             slot: inventory.selected_hotbar_slot,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_generations_do_not_alias_container_handles() {
+        assert_ne!(
+            InventorySyncState::default().menu_generation(),
+            InventorySyncState::default().menu_generation()
+        );
     }
 }

@@ -1,4 +1,6 @@
-use azalea_buf::AzBuf;
+use std::io::{self, Cursor, Write};
+
+use azalea_buf::{AzBuf, AzBufVar, BufReadError};
 use azalea_inventory::ItemStack;
 use azalea_registry::{
     HolderSet,
@@ -6,6 +8,22 @@ use azalea_registry::{
     data::TrimPattern,
     identifier::Identifier,
 };
+
+/// A server-assigned recipe display identifier.
+///
+/// These identifiers are only valid for the current recipe-book generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecipeDisplayId(pub u32);
+
+impl AzBuf for RecipeDisplayId {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(Self(u32::azalea_read_var(buf)?))
+    }
+
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        self.0.azalea_write_var(buf)
+    }
+}
 
 /// [`azalea_registry::builtin::RecipeDisplay`]
 #[derive(AzBuf, Clone, Debug, PartialEq)]
@@ -93,9 +111,23 @@ pub struct OnlyWithComponentSlotDisplay {
 pub struct ItemSlotDisplay {
     pub item: ItemKind,
 }
-#[derive(AzBuf, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ItemStackSlotDisplay {
     pub stack: ItemStack,
+}
+
+// vanilla's SlotDisplay.ItemStackSlotDisplay carries the stack in the
+// template wire form (item id, count, patch), not the count-first codec
+// inventory slots use
+impl AzBuf for ItemStackSlotDisplay {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(ItemStackSlotDisplay {
+            stack: ItemStack::azalea_read_template(buf)?,
+        })
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        self.stack.azalea_write_template(buf)
+    }
 }
 #[derive(AzBuf, Clone, Debug, PartialEq)]
 pub struct DyedSlotDemo {

@@ -214,10 +214,10 @@ impl ItemStackData {
     /// This is used for things like getting the damage of an item, or seeing
     /// how much food it replenishes.
     pub fn get_component<'a, T: components::DataComponentTrait>(&'a self) -> Option<Cow<'a, T>> {
-        if let Some(c) = self.component_patch.get::<T>() {
-            Some(Cow::Borrowed(c))
+        if self.component_patch.components.contains_key(&T::KIND) {
+            self.component_patch.get::<T>().map(Cow::Borrowed)
         } else {
-            get_default_component::<T>(self.kind).map(|c| Cow::Owned(c))
+            get_default_component::<T>(self.kind).map(Cow::Owned)
         }
     }
 }
@@ -247,6 +247,53 @@ impl AzBuf for ItemStack {
             }
         };
         Ok(())
+    }
+}
+
+impl ItemStackData {
+    /// Read the "item stack template" wire form (vanilla's
+    /// `ItemStackTemplate`, since 26.1): item id, then count, then the
+    /// component patch.
+    ///
+    /// Stacks nested inside data components (`container`, `bundle_contents`,
+    /// `charged_projectiles`, `use_remainder`) use this layout instead of the
+    /// count-first one top-level slots use; unlike that one, it has no
+    /// encoding for an empty stack.
+    pub fn azalea_read_template(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        let kind = ItemKind::azalea_read(buf)?;
+        let count = i32::azalea_read_var(buf)?;
+        let component_patch = DataComponentPatch::azalea_read(buf)?;
+        Ok(ItemStackData {
+            count,
+            kind,
+            component_patch,
+        })
+    }
+
+    /// Write the "item stack template" wire form. See
+    /// [`ItemStackData::azalea_read_template`].
+    pub fn azalea_write_template(&self, buf: &mut impl Write) -> io::Result<()> {
+        self.kind.azalea_write(buf)?;
+        self.count.azalea_write_var(buf)?;
+        self.component_patch.azalea_write(buf)
+    }
+}
+
+impl ItemStack {
+    /// Read the "item stack template" wire form. See
+    /// [`ItemStackData::azalea_read_template`].
+    pub fn azalea_read_template(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(ItemStack::from(ItemStackData::azalea_read_template(buf)?))
+    }
+
+    /// Write the "item stack template" wire form, which can't express
+    /// emptiness: an empty stack degrades to an air template, which reads
+    /// back as [`ItemStack::Empty`].
+    pub fn azalea_write_template(&self, buf: &mut impl Write) -> io::Result<()> {
+        match self.as_present() {
+            Some(data) => data.azalea_write_template(buf),
+            None => ItemStackData::new(ItemKind::Air, 0).azalea_write_template(buf),
+        }
     }
 }
 
@@ -316,8 +363,8 @@ impl DataComponentPatch {
     ) -> Option<&dyn components::EncodableDataComponent> {
         self.components.get(&kind).and_then(|c| {
             c.as_ref().map(|c| {
-                // SAFETY: we just got the component from the map, so it must be the correct
-                // kind
+                // SAFETY: we just got the component from the map, so it must be
+                // the correct kind
                 unsafe { c.as_kind(kind) }
             })
         })
@@ -339,6 +386,10 @@ impl DataComponentPatch {
 
     pub fn has_kind(&self, kind: DataComponentKind) -> bool {
         self.get_kind(kind).is_some()
+    }
+
+    pub fn is_removed<T: components::DataComponentTrait>(&self) -> bool {
+        matches!(self.components.get(&T::KIND), Some(None))
     }
 
     pub fn iter<'a>(
@@ -367,8 +418,8 @@ impl DataComponentPatch {
     ) {
         let existing = self.components.insert(kind, value);
         if let Some(Some(mut existing)) = existing {
-            // SAFETY: we just got it from self.components, so it must already be the
-            // correct type
+            // SAFETY: we just got it from self.components, so it must already
+            // be the correct type
             unsafe { existing.drop_as(kind) };
         }
     }
@@ -433,7 +484,8 @@ impl AzBuf for DataComponentPatch {
                 kind.azalea_write(buf)?;
 
                 component_buf.clear();
-                // SAFETY: we got the component from the map and are passing in the same kind
+                // SAFETY: we got the component from the map and are passing in
+                // the same kind
                 unsafe { component.azalea_write_as(*kind, &mut component_buf) }?;
                 buf.write_all(&component_buf)?;
             }
@@ -482,8 +534,9 @@ impl PartialEq for DataComponentPatch {
                 let Some(other_component) = other_component else {
                     return false;
                 };
-                // SAFETY: we already checked that the kinds are the same, and we got the
-                // components from the map, so they must be the correct kinds
+                // SAFETY: we already checked that the kinds are the same, and
+                // we got the components from the map, so they
+                // must be the correct kinds
                 if !unsafe { component.eq_as(other_component, *kind) } {
                     return false;
                 }
@@ -516,13 +569,97 @@ impl Serialize for DataComponentPatch {
 
 #[cfg(test)]
 mod tests {
+    use azalea_registry::{Registry, builtin::DataComponentKind};
+
     use super::*;
-    use crate::components::MapId;
+    use crate::{
+        components::{Container, MapId, MaxStackSize},
+        item::MaxStackSizeExt,
+    };
 
     #[test]
     fn test_get_component() {
         let item = ItemStack::from(ItemKind::Map).with_component(MapId { id: 1 });
         let map_id = item.get_component::<MapId>().unwrap();
         assert_eq!(map_id.id, 1);
+    }
+
+    #[test]
+    fn explicit_component_removal_does_not_restore_the_default() {
+        let item = ItemStack::new(ItemKind::Dirt, 1).with_component::<MaxStackSize>(None);
+        assert!(item.get_component::<MaxStackSize>().is_none());
+        assert_eq!(item.max_stack_size(), 1);
+    }
+
+    fn varint(value: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        value.azalea_write_var(&mut out).unwrap();
+        out
+    }
+
+    /// The wire layout of a `container_set_content` slot holding a shulker
+    /// box with two stacks inside its `container` component, as captured
+    /// from vanilla 26.1.2 traffic. The registry ids are resolved through
+    /// the registry because they shift between versions; the layout doesn't.
+    ///
+    /// Stacks nested inside data components use vanilla's
+    /// `ItemStackTemplate` form — item id, then count, then component patch,
+    /// each entry behind a presence bool in `container` — not the
+    /// count-first form of the top-level slot.
+    fn shulker_slot_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(varint(1)); // top-level: count first
+        bytes.extend(varint(ItemKind::ShulkerBox.to_u32()));
+        bytes.extend(varint(1)); // components with data
+        bytes.extend(varint(0)); // components without data
+        bytes.extend(varint(DataComponentKind::Container.to_u32()));
+        bytes.extend(varint(2)); // container entries
+        for kind in [ItemKind::Diamond, ItemKind::NetheriteIngot] {
+            bytes.push(0x01); // present
+            bytes.extend(varint(kind.to_u32())); // template: id first
+            bytes.extend(varint(64)); // then count
+            bytes.extend([0x00, 0x00]); // then an empty component patch
+        }
+        bytes
+    }
+
+    #[test]
+    fn template_stacks_match_vanilla_bytes() {
+        let bytes = shulker_slot_bytes();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let stack = ItemStack::azalea_read(&mut cursor).unwrap();
+        assert_eq!(cursor.position() as usize, bytes.len());
+
+        let data = stack.as_present().unwrap();
+        assert_eq!(data.kind, ItemKind::ShulkerBox);
+        assert_eq!(data.count, 1);
+        let container = data.get_component::<Container>().unwrap();
+        assert_eq!(
+            container.items,
+            vec![
+                ItemStack::new(ItemKind::Diamond, 64),
+                ItemStack::new(ItemKind::NetheriteIngot, 64),
+            ]
+        );
+
+        let mut out = Vec::new();
+        stack.azalea_write(&mut out).unwrap();
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn container_encodes_empty_slots_with_presence_bools() {
+        let container = Container {
+            items: vec![ItemStack::Empty, ItemStack::new(ItemKind::Stone, 3)],
+        };
+        let mut out = Vec::new();
+        container.azalea_write(&mut out).unwrap();
+        // two entries; an empty slot is a single absent bool, and a present
+        // entry leads with its presence bool
+        assert_eq!(out[..3], [0x02, 0x00, 0x01]);
+
+        let mut cursor = Cursor::new(out.as_slice());
+        assert_eq!(Container::azalea_read(&mut cursor).unwrap(), container);
+        assert_eq!(cursor.position() as usize, out.len());
     }
 }

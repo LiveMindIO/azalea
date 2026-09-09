@@ -11,6 +11,7 @@ pub mod bot;
 mod builder;
 mod client_impl;
 pub mod container;
+pub mod crafting;
 mod entity_ref;
 pub mod events;
 mod join_opts;

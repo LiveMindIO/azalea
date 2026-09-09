@@ -6,7 +6,7 @@ pub struct ClientboundRecipeBookSettings {
     pub book_settings: RecipeBookSettings,
 }
 
-#[derive(AzBuf, Clone, Debug, PartialEq)]
+#[derive(AzBuf, Clone, Debug, Default, PartialEq)]
 pub struct RecipeBookSettings {
     pub gui_open: bool,
     pub filtering_craftable: bool,

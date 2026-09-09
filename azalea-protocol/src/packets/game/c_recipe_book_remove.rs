@@ -1,8 +1,9 @@
 use azalea_buf::AzBuf;
 use azalea_protocol_macros::ClientboundGamePacket;
 
+use crate::common::recipe::RecipeDisplayId;
+
 #[derive(AzBuf, ClientboundGamePacket, Clone, Debug, PartialEq)]
 pub struct ClientboundRecipeBookRemove {
-    #[var]
-    pub recipes: Vec<u32>,
+    pub recipes: Vec<RecipeDisplayId>,
 }

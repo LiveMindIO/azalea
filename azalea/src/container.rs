@@ -2,7 +2,7 @@ use std::{fmt, fmt::Debug};
 
 use azalea_chat::FormattedText;
 use azalea_client::{
-    inventory::{CloseContainerEvent, ContainerClickEvent},
+    inventory::{CloseContainerEvent, ContainerClickEvent, InventorySyncState},
     packet::game::ReceiveGamePacketEvent,
 };
 use azalea_core::position::BlockPos;
@@ -107,8 +107,12 @@ impl Client {
         let mut ticks = self.get_tick_broadcaster();
         let mut elapsed_ticks = 0;
         while ticks.recv().await.is_ok() {
-            let ecs = self.ecs.read();
-            if ecs.get::<WaitingForInventoryOpen>(self.entity).is_none() {
+            let is_waiting = self
+                .ecs
+                .read()
+                .get::<WaitingForInventoryOpen>(self.entity)
+                .is_some();
+            if !is_waiting {
                 break;
             }
 
@@ -116,6 +120,10 @@ impl Client {
             if let Some(timeout_ticks) = timeout_ticks
                 && elapsed_ticks >= timeout_ticks
             {
+                self.ecs
+                    .write()
+                    .entity_mut(self.entity)
+                    .remove::<WaitingForInventoryOpen>();
                 return Ok(None);
             }
         }
@@ -179,21 +187,34 @@ impl Client {
 /// if that behavior is desired.
 pub struct ContainerHandleRef {
     id: i32,
+    generation: u64,
     client: Client,
 }
 impl Debug for ContainerHandleRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ContainerHandle")
             .field("id", &self.id())
+            .field("generation", &self.generation())
             .finish()
     }
 }
 impl ContainerHandleRef {
     pub fn new(id: i32, client: Client) -> Self {
-        Self { id, client }
+        let generation = client
+            .component::<InventorySyncState>()
+            .map(|state| state.menu_generation())
+            .unwrap_or_default();
+        Self {
+            id,
+            generation,
+            client,
+        }
     }
 
     pub fn close(&self) {
+        if !matches!(self.map_inventory(|_| ()), Ok(Some(()))) {
+            return;
+        }
         self.client.ecs.write().trigger(CloseContainerEvent {
             entity: self.client.entity,
             id: self.id,
@@ -207,6 +228,11 @@ impl ContainerHandleRef {
     /// at a time.
     pub fn id(&self) -> i32 {
         self.id
+    }
+
+    /// Return the local generation of this container handle.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Returns the menu of the container.
@@ -227,14 +253,15 @@ impl ContainerHandleRef {
     }
 
     fn map_inventory<R>(&self, f: impl FnOnce(&Inventory) -> R) -> AzaleaResult<Option<R>> {
-        self.client.query_self::<&Inventory, _>(|inv| {
-            if inv.id == self.id {
-                Some(f(inv))
-            } else {
-                // a different inventory is open
-                None
-            }
-        })
+        self.client
+            .query_self::<(&Inventory, &InventorySyncState), _>(|(inv, sync_state)| {
+                if inv.id == self.id && sync_state.menu_generation() == self.generation {
+                    Some(f(inv))
+                } else {
+                    // a different inventory is open
+                    None
+                }
+            })
     }
 
     /// Returns the item slots in the container, not including the player's
@@ -291,6 +318,9 @@ impl ContainerHandleRef {
     /// Simulate a click in the container and send the packet to perform the
     /// action.
     pub fn click(&self, operation: impl Into<ClickOperation>) {
+        if !matches!(self.map_inventory(|_| ()), Ok(Some(()))) {
+            return;
+        }
         let operation = operation.into();
         self.client.ecs.write().trigger(ContainerClickEvent {
             entity: self.client.entity,
@@ -320,7 +350,7 @@ impl Debug for ContainerHandle {
 }
 impl ContainerHandle {
     fn new(id: i32, client: Client) -> Self {
-        Self(ContainerHandleRef { id, client })
+        Self(ContainerHandleRef::new(id, client))
     }
 
     /// Closes the inventory by dropping the handle.
@@ -335,9 +365,15 @@ pub struct WaitingForInventoryOpen;
 pub fn handle_menu_opened_event(
     mut commands: Commands,
     mut events: MessageReader<ReceiveGamePacketEvent>,
+    query: bevy_ecs::prelude::Query<&Inventory>,
 ) {
     for event in events.read() {
-        if let ClientboundGamePacket::ContainerSetContent { .. } = event.packet.as_ref() {
+        if let ClientboundGamePacket::ContainerSetContent(packet) = event.packet.as_ref()
+            && packet.container_id != 0
+            && query
+                .get(event.entity)
+                .is_ok_and(|inventory| inventory.id == packet.container_id)
+        {
             commands
                 .entity(event.entity)
                 .remove::<WaitingForInventoryOpen>();

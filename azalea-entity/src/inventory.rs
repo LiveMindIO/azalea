@@ -2,7 +2,7 @@ use std::{cmp, collections::HashSet};
 
 use azalea_chat::FormattedText;
 use azalea_inventory::{
-    ItemStack, ItemStackData, Menu,
+    ItemStack, ItemStackData, Menu, Player,
     components::EquipmentSlot,
     item::MaxStackSizeExt,
     operations::{
@@ -90,6 +90,67 @@ impl Inventory {
         }
     }
 
+    /// Set a slot addressed the way vanilla's `Inventory` container (and the
+    /// `set_player_inventory` packet) addresses it: 0-8 hotbar, 9-35 main,
+    /// 36-39 armor (feet to head), 40 offhand.
+    ///
+    /// Main and hotbar rows route into the open container's player rows when
+    /// one is open — closing copies those back over `inventory_menu`, so
+    /// writing `inventory_menu` directly would be stomped. Armor and offhand
+    /// slots only exist on the player menu, which the close copy-back doesn't
+    /// touch.
+    pub fn set_player_inventory_slot(&mut self, inventory_index: u32, stack: ItemStack) {
+        let player_menu_index = match inventory_index {
+            0..=8 => *Player::HOTBAR_SLOTS.start() + inventory_index as usize,
+            9..=35 => {
+                *Player::INVENTORY_WITHOUT_HOTBAR_SLOTS.start() + (inventory_index as usize - 9)
+            }
+            36..=40 => {
+                // player-menu armor runs head to feet (5-8), the inventory
+                // runs feet to head; 40 is the offhand
+                let menu_index = match inventory_index {
+                    40 => Player::OFFHAND_SLOT,
+                    _ => 5 + (39 - inventory_index as usize),
+                };
+                *self.inventory_menu.slot_mut(menu_index).unwrap() = stack;
+                return;
+            }
+            _ => return,
+        };
+        self.set_player_menu_slot(player_menu_index, stack);
+    }
+
+    /// Set a player-menu slot and mirror shared player inventory slots into an
+    /// open container.
+    pub fn set_player_menu_slot(&mut self, player_menu_index: usize, stack: ItemStack) {
+        if let Some(slot) = self.inventory_menu.slot_mut(player_menu_index) {
+            *slot = stack.clone();
+        } else {
+            return;
+        }
+
+        let Some(container_menu) = self.container_menu.as_mut() else {
+            return;
+        };
+        if !Player::INVENTORY_SLOTS.contains(&player_menu_index) {
+            return;
+        }
+        let offset = player_menu_index - *Player::INVENTORY_SLOTS.start();
+        let container_index = *container_menu.player_slots_range().start() + offset;
+        *container_menu.slot_mut(container_index).unwrap() = stack;
+    }
+
+    /// Mirror the active container's player slots into the player menu.
+    pub fn sync_player_slots_from_container(&mut self) {
+        let Some(container_menu) = self.container_menu.as_ref() else {
+            return;
+        };
+        let player_slots = container_menu.slots()[container_menu.player_slots_range()].to_vec();
+        for (slot_index, stack) in Player::INVENTORY_SLOTS.zip(player_slots) {
+            *self.inventory_menu.slot_mut(slot_index).unwrap() = stack;
+        }
+    }
+
     /// Modify the inventory as if the given operation was performed on it.
     pub fn simulate_click(
         &mut self,
@@ -105,8 +166,8 @@ impl Inventory {
             if self.carried.is_empty() {
                 return self.reset_quick_craft();
             }
-            // if we were starting or ending, or now we aren't ending and the status
-            // changed, reset
+            // if we were starting or ending, or now we aren't ending and the
+            // status changed, reset
             if (last_quick_craft_status == QuickCraftStatusKind::Start
                 || last_quick_craft_status == QuickCraftStatusKind::End
                 || self.quick_craft_status != QuickCraftStatusKind::End)
@@ -132,7 +193,8 @@ impl Inventory {
                 {
                     // minecraft also checks slot.may_place(carried) and
                     // menu.can_drag_to(slot)
-                    // but they always return true so they're not relevant for us
+                    // but they always return true so they're not relevant for
+                    // us
                     if can_item_quick_replace(slot_item, &self.carried, true)
                         && (self.quick_craft_kind == QuickCraftKind::Right
                             || carried.count as usize > self.quick_craft_slots.len())
@@ -219,19 +281,16 @@ impl Inventory {
                             slot_item_count,
                         );
                         let max_stack_size = i32::min(
-                            new_carried.kind.max_stack_size(),
-                            i32::min(
-                                new_carried.kind.max_stack_size(),
-                                slot.kind.max_stack_size(),
-                            ),
+                            self.menu().max_stack_size(slot_index as usize),
+                            i32::min(new_carried.max_stack_size(), slot.max_stack_size()),
                         );
                         if new_carried.count > max_stack_size {
                             new_carried.count = max_stack_size;
                         }
 
                         carried_count -= new_carried.count - slot_item_count;
-                        // we have to inline self.menu_mut() here to avoid the borrow checker
-                        // complaining
+                        // we have to inline self.menu_mut() here to avoid the
+                        // borrow checker complaining
                         let menu = match &mut self.container_menu {
                             Some(menu) => menu,
                             _ => &mut self.inventory_menu,
@@ -244,8 +303,8 @@ impl Inventory {
                 return self.reset_quick_craft();
             }
         }
-        // the quick craft status should always be in start if we're not in quick craft
-        // mode
+        // the quick craft status should always be in start if we're not in
+        // quick craft mode
         if self.quick_craft_status != QuickCraftStatusKind::Start {
             return self.reset_quick_craft();
         }
@@ -257,8 +316,8 @@ impl Inventory {
             {
                 // vanilla has `player.drop`s but they're only used
                 // server-side
-                // they're included as comments here in case you want to adapt this for a server
-                // implementation
+                // they're included as comments here in case you want to adapt
+                // this for a server implementation
 
                 // player.drop(self.carried, true);
                 self.carried = ItemStack::Empty;
@@ -315,7 +374,7 @@ impl Inventory {
                                     <= self
                                         .menu()
                                         .max_stack_size(slot)
-                                        .min(carried.kind.max_stack_size())
+                                        .min(carried.max_stack_size())
                                 {
                                     // swap slot_item and carried
                                     self.carried = slot_item.clone();
@@ -326,11 +385,11 @@ impl Inventory {
                                 && let Some(removed) = self.try_remove(
                                     slot,
                                     slot_item.count(),
-                                    carried.kind.max_stack_size() - carried.count,
+                                    carried.max_stack_size() - carried.count,
                                 )
                             {
                                 self.carried.as_present_mut().unwrap().count += removed.count();
-                                // slot.onTake(player, removed);
+                                self.menu_mut().crafting_result_on_take(slot);
                             }
                         } else {
                             let pickup_count = if is_left_click {
@@ -342,7 +401,7 @@ impl Inventory {
                                 self.try_remove(slot, pickup_count, i32::MAX)
                             {
                                 self.carried = new_slot_item;
-                                // slot.onTake(player, newSlot);
+                                self.menu_mut().crafting_result_on_take(slot);
                             }
                         }
                     }
@@ -351,8 +410,9 @@ impl Inventory {
             &ClickOperation::QuickMove(
                 QuickMoveClick::Left { slot } | QuickMoveClick::Right { slot },
             ) => {
-                // in vanilla it also tests if QuickMove has a slot index of -999
-                // but i don't think that's ever possible so it's not covered here
+                // in vanilla it also tests if QuickMove has a slot index of
+                // -999 but i don't think that's ever possible
+                // so it's not covered here
                 let slot = slot as usize;
                 loop {
                     let new_slot_item = self.menu_mut().quick_move_stack(slot);
@@ -402,7 +462,8 @@ impl Inventory {
                     if self.menu().may_place(source_slot_index, target_item) {
                         let source_max_stack = self.menu().max_stack_size(source_slot_index);
                         if target_slot.count() > source_max_stack {
-                            // if there's more than the max stack size in the target slot
+                            // if there's more than the max stack size in the
+                            // target slot
 
                             let target_slot = self.menu_mut().slot_mut(target_slot_index).unwrap();
                             let new_source_slot =
@@ -436,7 +497,7 @@ impl Inventory {
                     return;
                 };
                 let mut new_carried = source_item.clone();
-                new_carried.count = new_carried.kind.max_stack_size();
+                new_carried.count = new_carried.max_stack_size();
                 self.carried = ItemStack::Present(new_carried);
             }
             ClickOperation::Throw(c) => {
@@ -478,10 +539,6 @@ impl Inventory {
                     return;
                 }
 
-                let ItemStack::Present(target_slot_item) = &target_slot else {
-                    unreachable!("target slot is not empty but is not present");
-                };
-
                 for round in 0..2 {
                     let iterator: Box<dyn Iterator<Item = usize>> = if *reversed {
                         Box::new((0..self.menu().len()).rev())
@@ -490,26 +547,23 @@ impl Inventory {
                     };
 
                     for i in iterator {
-                        if target_slot_item.count < target_slot_item.kind.max_stack_size() {
-                            let checking_slot = self.menu().slot(i).unwrap();
-                            if let ItemStack::Present(checking_item) = checking_slot
-                                && can_item_quick_replace(checking_slot, &target_slot, true)
-                                && self.menu().may_pickup(i)
-                                && (round != 0
-                                    || checking_item.count != checking_item.kind.max_stack_size())
-                            {
-                                // get the checking_slot and checking_item again but mutable
-                                let checking_slot = self.menu_mut().slot_mut(i).unwrap();
-
-                                let taken_item = checking_slot.split(checking_slot.count() as u32);
-
-                                // now extend the carried item
-                                let target_slot = &mut self.carried;
-                                let ItemStack::Present(target_slot_item) = target_slot else {
-                                    unreachable!("target slot is not empty but is not present");
-                                };
-                                target_slot_item.count += taken_item.count();
-                            }
+                        let ItemStack::Present(carried) = &self.carried else {
+                            unreachable!("target slot is not empty but is not present");
+                        };
+                        let capacity = carried.max_stack_size() - carried.count;
+                        if capacity <= 0 {
+                            return;
+                        }
+                        let checking_slot = self.menu().slot(i).unwrap();
+                        if let ItemStack::Present(checking_item) = checking_slot
+                            && can_item_quick_replace(checking_slot, &target_slot, true)
+                            && self.menu().may_pickup(i)
+                            && (round != 0 || checking_item.count != checking_item.max_stack_size())
+                        {
+                            let checking_slot = self.menu_mut().slot_mut(i).unwrap();
+                            let take_count = i32::min(checking_slot.count(), capacity);
+                            let taken_item = checking_slot.split(take_count as u32);
+                            self.carried.as_present_mut().unwrap().count += taken_item.count();
                         }
                     }
                 }
@@ -540,16 +594,22 @@ impl Inventory {
     }
 
     fn safe_insert(&mut self, slot: usize, src_item: ItemStack, take_count: i32) -> ItemStack {
-        let Some(slot_item) = self.menu_mut().slot_mut(slot) else {
-            return src_item;
-        };
         let ItemStack::Present(mut src_item) = src_item else {
             return src_item;
+        };
+        // vanilla's Slot.safeInsert refuses before touching the slot; this
+        // is what keeps a click from placing items into a result slot
+        if !self.menu().may_place(slot, &src_item) {
+            return ItemStack::Present(src_item);
+        }
+        let slot_max_stack_size = self.menu().max_stack_size(slot);
+        let Some(slot_item) = self.menu_mut().slot_mut(slot) else {
+            return ItemStack::Present(src_item);
         };
 
         let take_count = cmp::min(
             cmp::min(take_count, src_item.count),
-            src_item.kind.max_stack_size() - slot_item.count(),
+            slot_max_stack_size.min(src_item.max_stack_size()) - slot_item.count(),
         );
         if take_count <= 0 {
             return src_item.into();
@@ -581,12 +641,21 @@ impl Inventory {
         if count <= 0 {
             return None;
         }
-        // vanilla calls .remove here but i think it has the same behavior as split?
+        // a result slot yields the whole craft no matter the requested
+        // count (vanilla's ResultContainer.removeItem ignores it): a right
+        // click on an output takes the full result, never half
+        let count = if self.menu().is_result_slot(slot) {
+            slot_item.count()
+        } else {
+            count
+        };
+        // vanilla calls .remove here but i think it has the same behavior as
+        // split?
         let removed = slot_item.split(count as u32);
 
-        if removed.is_present() && slot_item.is_empty() {
-            *self.menu_mut().slot_mut(slot).unwrap() = ItemStack::Empty;
-        }
+        // write the remainder back: a partial removal shrinks the slot, not
+        // just the clone that was split
+        *self.menu_mut().slot_mut(slot).unwrap() = slot_item;
 
         Some(removed)
     }
@@ -608,9 +677,11 @@ impl Inventory {
             EquipmentSlot::Chest => &player.armor[1],
             EquipmentSlot::Head => &player.armor[0],
             EquipmentSlot::Body => {
-                // TODO: when riding entities is implemented, mount/horse inventories should be
-                // implemented too. note that horse inventories aren't a normal menu (they're
-                // not in MenuKind), maybe they should be a separate field in `Inventory`?
+                // TODO: when riding entities is implemented, mount/horse
+                // inventories should be implemented too. note
+                // that horse inventories aren't a normal menu (they're
+                // not in MenuKind), maybe they should be a separate field in
+                // `Inventory`?
                 return None;
             }
             EquipmentSlot::Saddle => {
@@ -645,7 +716,7 @@ fn can_item_quick_replace(
         } else {
             item.count as u16
         };
-    count <= item.kind.max_stack_size() as u16
+    count <= item.max_stack_size() as u16
 }
 
 fn get_quick_craft_slot_count(
@@ -657,7 +728,7 @@ fn get_quick_craft_slot_count(
     item.count = match quick_craft_kind {
         QuickCraftKind::Left => item.count / quick_craft_slots.len() as i32,
         QuickCraftKind::Right => 1,
-        QuickCraftKind::Middle => item.kind.max_stack_size(),
+        QuickCraftKind::Middle => item.max_stack_size(),
     };
     item.count += slot_item_count;
 }
@@ -681,32 +752,40 @@ impl Default for Inventory {
 
 #[cfg(test)]
 mod tests {
-    use azalea_inventory::SlotList;
+    use azalea_inventory::{SlotList, components::MaxStackSize};
     use azalea_registry::builtin::ItemKind;
 
     use super::*;
 
-    #[test]
-    fn test_simulate_shift_click_in_crafting_table() {
-        let spruce_planks = ItemStack::new(ItemKind::SprucePlanks, 4);
-
-        let mut inventory = Inventory {
+    /// A crafting-table menu holding one log in the grid and its planks in
+    /// the result slot, with the cursor as given.
+    fn crafting_menu_inventory(carried: ItemStack) -> Inventory {
+        let mut grid = SlotList::default();
+        grid[0] = ItemStack::new(ItemKind::SpruceLog, 1);
+        Inventory {
             inventory_menu: Menu::Player(azalea_inventory::Player::default()),
             id: 1,
             container_menu: Some(Menu::Crafting {
-                result: spruce_planks.clone(),
-                // simulate_click won't delete the items from here
-                grid: SlotList::default(),
+                result: ItemStack::new(ItemKind::SprucePlanks, 4),
+                grid,
                 player: SlotList::default(),
             }),
             container_menu_title: None,
-            carried: ItemStack::Empty,
+            carried,
             state_id: 0,
             quick_craft_status: QuickCraftStatusKind::Start,
             quick_craft_kind: QuickCraftKind::Middle,
             quick_craft_slots: HashSet::new(),
             selected_hotbar_slot: 0,
-        };
+        }
+    }
+
+    const CRAFTING_GRID_FIRST_SLOT: usize = *Menu::CRAFTING_GRID_SLOTS.start();
+
+    #[test]
+    fn test_simulate_shift_click_in_crafting_table() {
+        let spruce_planks = ItemStack::new(ItemKind::SprucePlanks, 4);
+        let mut inventory = crafting_menu_inventory(ItemStack::Empty);
 
         inventory.simulate_click(
             &ClickOperation::QuickMove(QuickMoveClick::Left { slot: 0 }),
@@ -715,9 +794,167 @@ mod tests {
 
         let new_slots = inventory.menu().slots();
         assert_eq!(&new_slots[0], &ItemStack::Empty);
+        // crafted results move out of a container in reverse, so they land
+        // in the last hotbar slot first
         assert_eq!(
-            &new_slots[*Menu::CRAFTING_PLAYER_SLOTS.start()],
+            &new_slots[*Menu::CRAFTING_PLAYER_SLOTS.end()],
             &spruce_planks
+        );
+        // taking the craft consumed the grid
+        assert_eq!(&new_slots[CRAFTING_GRID_FIRST_SLOT], &ItemStack::Empty);
+    }
+
+    #[test]
+    fn test_simulate_pickup_crafting_result() {
+        let mut inventory = crafting_menu_inventory(ItemStack::Empty);
+
+        inventory.simulate_click(
+            &ClickOperation::Pickup(PickupClick::Left { slot: Some(0) }),
+            &PlayerAbilities::default(),
+        );
+
+        assert_eq!(inventory.carried, ItemStack::new(ItemKind::SprucePlanks, 4));
+        let new_slots = inventory.menu().slots();
+        assert_eq!(&new_slots[0], &ItemStack::Empty);
+        // taking the craft consumed the grid
+        assert_eq!(&new_slots[CRAFTING_GRID_FIRST_SLOT], &ItemStack::Empty);
+    }
+
+    #[test]
+    fn test_simulate_right_click_crafting_result_takes_all() {
+        let mut inventory = crafting_menu_inventory(ItemStack::Empty);
+
+        inventory.simulate_click(
+            &ClickOperation::Pickup(PickupClick::Right { slot: Some(0) }),
+            &PlayerAbilities::default(),
+        );
+
+        // a result slot yields the whole craft, never half
+        assert_eq!(inventory.carried, ItemStack::new(ItemKind::SprucePlanks, 4));
+        assert_eq!(inventory.menu().slot(0).unwrap(), &ItemStack::Empty);
+    }
+
+    #[test]
+    fn test_simulate_craft_onto_carried_stack() {
+        let mut inventory = crafting_menu_inventory(ItemStack::new(ItemKind::SprucePlanks, 4));
+
+        inventory.simulate_click(
+            &ClickOperation::Pickup(PickupClick::Left { slot: Some(0) }),
+            &PlayerAbilities::default(),
+        );
+
+        // the result merges into the cursor; it must never absorb the
+        // cursor into the result slot
+        assert_eq!(inventory.carried, ItemStack::new(ItemKind::SprucePlanks, 8));
+        let new_slots = inventory.menu().slots();
+        assert_eq!(&new_slots[0], &ItemStack::Empty);
+        assert_eq!(&new_slots[CRAFTING_GRID_FIRST_SLOT], &ItemStack::Empty);
+    }
+
+    #[test]
+    fn test_simulate_place_into_result_slot_refused() {
+        let dirt = ItemStack::new(ItemKind::Dirt, 4);
+        let mut inventory = crafting_menu_inventory(dirt.clone());
+        *inventory.menu_mut().slot_mut(0).unwrap() = ItemStack::Empty;
+
+        inventory.simulate_click(
+            &ClickOperation::Pickup(PickupClick::Left { slot: Some(0) }),
+            &PlayerAbilities::default(),
+        );
+
+        // result slots refuse placement; the cursor keeps its stack
+        assert_eq!(inventory.carried, dirt);
+        assert_eq!(inventory.menu().slot(0).unwrap(), &ItemStack::Empty);
+    }
+
+    #[test]
+    fn test_simulate_crafting_remainder() {
+        let mut inventory = crafting_menu_inventory(ItemStack::Empty);
+        *inventory
+            .menu_mut()
+            .slot_mut(CRAFTING_GRID_FIRST_SLOT)
+            .unwrap() = ItemStack::new(ItemKind::MilkBucket, 1);
+
+        inventory.simulate_click(
+            &ClickOperation::Pickup(PickupClick::Left { slot: Some(0) }),
+            &PlayerAbilities::default(),
+        );
+
+        // consuming a milk bucket leaves the empty bucket in its grid cell
+        assert_eq!(
+            inventory.menu().slot(CRAFTING_GRID_FIRST_SLOT).unwrap(),
+            &ItemStack::new(ItemKind::Bucket, 1)
+        );
+    }
+
+    #[test]
+    fn test_simulate_right_click_pickup_splits_slot() {
+        let mut inventory = Inventory::default();
+        let main_start = *azalea_inventory::Player::INVENTORY_WITHOUT_HOTBAR_SLOTS.start();
+        *inventory.menu_mut().slot_mut(main_start).unwrap() =
+            ItemStack::new(ItemKind::SprucePlanks, 64);
+
+        inventory.simulate_click(
+            &ClickOperation::Pickup(PickupClick::Right {
+                slot: Some(main_start as u16),
+            }),
+            &PlayerAbilities::default(),
+        );
+
+        // right click picks up half the stack; the slot keeps the other half
+        assert_eq!(
+            inventory.carried,
+            ItemStack::new(ItemKind::SprucePlanks, 32)
+        );
+        assert_eq!(
+            inventory.menu().slot(main_start).unwrap(),
+            &ItemStack::new(ItemKind::SprucePlanks, 32)
+        );
+    }
+
+    #[test]
+    fn test_pickup_all_honors_stack_max_size_component() {
+        let stack = |count| {
+            ItemStack::new(ItemKind::SprucePlanks, count).with_component(MaxStackSize { count: 16 })
+        };
+        let mut inventory = Inventory {
+            carried: stack(10),
+            ..Default::default()
+        };
+        let main_start = *azalea_inventory::Player::INVENTORY_WITHOUT_HOTBAR_SLOTS.start();
+        *inventory.menu_mut().slot_mut(main_start).unwrap() = stack(10);
+
+        inventory.simulate_click(
+            &ClickOperation::PickupAll(PickupAllClick {
+                slot: 0,
+                reversed: false,
+            }),
+            &PlayerAbilities::default(),
+        );
+
+        assert_eq!(inventory.carried, stack(16));
+        assert_eq!(inventory.menu().slot(main_start).unwrap(), &stack(4));
+    }
+
+    #[test]
+    fn test_pickup_into_armor_slot_honors_slot_limit() {
+        let mut inventory = Inventory {
+            carried: ItemStack::new(ItemKind::CarvedPumpkin, 64),
+            ..Default::default()
+        };
+
+        inventory.simulate_click(
+            &ClickOperation::Pickup(PickupClick::Left { slot: Some(5) }),
+            &PlayerAbilities::default(),
+        );
+
+        assert_eq!(
+            inventory.menu().slot(5).unwrap(),
+            &ItemStack::new(ItemKind::CarvedPumpkin, 1)
+        );
+        assert_eq!(
+            inventory.carried,
+            ItemStack::new(ItemKind::CarvedPumpkin, 63)
         );
     }
 }
