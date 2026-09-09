@@ -16,12 +16,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Nightly
-        run: rustup update nightly && rustup default nightly && rustup component add clippy
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly-2026-09-09 --component clippy
 
       - name: Clippy
-        run: cargo clippy --all-features
+        run: $HOME/.cargo/bin/cargo clippy --all-features
 
       - name: Test
         # The standalone azalea-core test harness currently triggers a nightly
         # compiler ICE; it remains compiled and exercised as a dependency.
-        run: cargo test --workspace --exclude azalea-core
+        run: $HOME/.cargo/bin/cargo test --workspace --exclude azalea-core
