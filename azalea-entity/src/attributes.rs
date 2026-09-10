@@ -16,6 +16,7 @@ use thiserror::Error;
 #[cfg_attr(feature = "bevy_ecs", derive(bevy_ecs::component::Component))]
 #[derive(Clone, Debug)]
 pub struct Attributes {
+    pub max_health: AttributeInstance,
     pub movement_speed: AttributeInstance,
     pub sneaking_speed: AttributeInstance,
     pub attack_speed: AttributeInstance,
@@ -34,6 +35,7 @@ impl Attributes {
     /// attribute, or `None` if the attribute isn't implemented.
     pub fn get_mut(&mut self, attribute: Attribute) -> Option<&mut AttributeInstance> {
         let value = match attribute {
+            Attribute::MaxHealth => &mut self.max_health,
             Attribute::MovementSpeed => &mut self.movement_speed,
             Attribute::SneakingSpeed => &mut self.sneaking_speed,
             Attribute::AttackSpeed => &mut self.attack_speed,

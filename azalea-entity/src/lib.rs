@@ -390,6 +390,7 @@ impl Attributes {
         // TODO: do the correct defaults for everything, some
         // entities have different defaults
         Attributes {
+            max_health: AttributeInstance::new(20.0),
             movement_speed: AttributeInstance::new(0.1f32 as f64),
             sneaking_speed: AttributeInstance::new(0.3),
             attack_speed: AttributeInstance::new(4.0),

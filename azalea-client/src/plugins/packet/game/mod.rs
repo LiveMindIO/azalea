@@ -9,8 +9,9 @@ use azalea_core::{
     position::{ChunkPos, Vec3},
 };
 use azalea_entity::{
-    Dead, EntityBundle, EntityKindComponent, HasClientLoaded, LoadedBy, LocalEntity, LookDirection,
-    Physics, PlayerAbilities, Position,
+    Attributes, Dead, EntityBundle, EntityKindComponent, HasClientLoaded, LoadedBy, LocalEntity,
+    LookDirection, Physics, PlayerAbilities, Position,
+    attributes::AttributeInstance,
     effect_events::{AddEffectEvent, RemoveEffectsEvent},
     indexing::{EntityIdIndex, EntityUuidIndex},
     inventory::Inventory,
@@ -739,8 +740,29 @@ impl GamePacketHandler<'_> {
         });
     }
 
-    pub fn update_attributes(&mut self, _p: &ClientboundUpdateAttributes) {
-        // debug!("Got update attributes packet {p:?}");
+    pub fn update_attributes(&mut self, p: &ClientboundUpdateAttributes) {
+        as_system::<(
+            Query<&EntityIdIndex, With<LocalEntity>>,
+            Query<&mut Attributes>,
+        )>(self.ecs, |(entity_id_index, mut attributes_query)| {
+            let entity_id_index = entity_id_index.get(self.player).unwrap();
+            let Some(entity) = entity_id_index.get_by_minecraft_entity(p.entity_id) else {
+                return;
+            };
+            let Ok(mut attributes) = attributes_query.get_mut(entity) else {
+                return;
+            };
+            for snapshot in &p.values {
+                let Some(attribute) = attributes.get_mut(snapshot.attribute) else {
+                    continue;
+                };
+                let mut updated = AttributeInstance::new(snapshot.base);
+                for modifier in &snapshot.modifiers {
+                    updated.insert(modifier.clone());
+                }
+                *attribute = updated;
+            }
+        });
     }
 
     pub fn set_entity_motion(&mut self, p: &ClientboundSetEntityMotion) {

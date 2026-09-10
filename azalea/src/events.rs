@@ -11,7 +11,7 @@ use azalea_protocol::{
     connect::ConnectionError, packets::game::c_player_combat_kill::ClientboundPlayerCombatKill,
 };
 use azalea_world::WorldName;
-use bevy_app::{App, Plugin, PreUpdate, Update};
+use bevy_app::{App, Plugin, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use derive_more::{Deref, DerefMut};
 use tokio::sync::broadcast;
@@ -167,10 +167,12 @@ impl Plugin for EventsPlugin {
                 update_player_listener,
                 remove_player_listener,
                 death_listener.after(azalea_client::packet::death_event_on_0_health),
-                disconnect_listener,
-                connection_failed_listener.after(azalea_client::join::poll_create_connection_task),
                 receive_chunk_listener,
             ),
+        )
+        .add_systems(
+            PostUpdate,
+            (disconnect_listener, connection_failed_listener),
         )
         .add_systems(
             PreUpdate,
@@ -307,10 +309,12 @@ pub fn keepalive_listener(keep_alive: On<KeepAliveEvent>, query: Query<&LocalPla
 pub fn disconnect_listener(
     query: Query<&LocalPlayerEvents>,
     mut events: MessageReader<DisconnectEvent>,
+    mut commands: Commands,
 ) {
     for event in events.read() {
         if let Ok(local_player_events) = query.get(event.entity) {
             let _ = local_player_events.send(Event::Disconnect(event.reason.clone()));
+            commands.entity(event.entity).remove::<LocalPlayerEvents>();
         }
     }
 }
@@ -318,10 +322,12 @@ pub fn disconnect_listener(
 pub fn connection_failed_listener(
     query: Query<&LocalPlayerEvents>,
     mut events: MessageReader<ConnectionFailedEvent>,
+    mut commands: Commands,
 ) {
     for event in events.read() {
         if let Ok(local_player_events) = query.get(event.entity) {
             let _ = local_player_events.send(Event::ConnectionFailed(event.error.clone()));
+            commands.entity(event.entity).remove::<LocalPlayerEvents>();
         }
     }
 }
@@ -355,5 +361,21 @@ mod tests {
 
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Lagged(1))));
         assert!(matches!(receiver.try_recv(), Ok(Event::Tick)));
+    }
+
+    #[test]
+    fn terminal_event_is_retained_after_normal_overflow() {
+        let (sender, mut receiver) = event_channel();
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            sender.send(Event::Tick).unwrap();
+        }
+        sender.send(Event::Disconnect(None)).unwrap();
+
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Lagged(1))));
+        let mut last = None;
+        while let Ok(event) = receiver.try_recv() {
+            last = Some(event);
+        }
+        assert!(matches!(last, Some(Event::Disconnect(None))));
     }
 }
