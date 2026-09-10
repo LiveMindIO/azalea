@@ -7,10 +7,7 @@ mod chat;
 mod events;
 pub mod prelude;
 
-use std::sync::{
-    Arc,
-    atomic::{self, AtomicBool},
-};
+use std::sync::Arc;
 
 use azalea_client::{account::Account, client_chat::ChatPacket, join::ConnectOpts};
 use azalea_entity::LocalEntity;
@@ -21,10 +18,13 @@ use bevy_ecs::prelude::*;
 pub use builder::SwarmBuilder;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
-use tokio::{sync::mpsc, task};
+use tokio::{
+    sync::{broadcast, mpsc},
+    task,
+};
 use tracing::{debug, error, warn};
 
-use crate::{Client, JoinOpts, client_impl::StartClientOpts};
+use crate::{Client, JoinOpts, client_impl::StartClientOpts, events::event_channel};
 
 /// A swarm is a way to conveniently control many bots at once, while also
 /// being able to control bots at an individual level when desired.
@@ -181,7 +181,7 @@ impl Swarm {
         let server_proxy = join_opts.server_proxy.clone();
         let sessionserver_proxy = join_opts.sessionserver_proxy.clone();
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = event_channel();
 
         let client = Client::start_client(StartClientOpts {
             ecs_lock: self.ecs.clone(),
@@ -215,44 +215,24 @@ impl Swarm {
     /// Copy the events from a client's receiver into bots_tx, until the bot is
     /// removed from the ECS.
     async fn event_copying_task(
-        mut rx: mpsc::UnboundedReceiver<crate::Event>,
+        mut rx: broadcast::Receiver<crate::Event>,
         swarm_tx: mpsc::UnboundedSender<SwarmEvent>,
         bots_tx: mpsc::UnboundedSender<(Option<crate::Event>, Client)>,
         bot: Client,
         join_opts: JoinOpts,
     ) {
-        while let Some(event) = rx.recv().await {
-            if rx.len() > 1_000 {
-                static WARNED_1_000: AtomicBool = AtomicBool::new(false);
-                if !WARNED_1_000.swap(true, atomic::Ordering::Relaxed) {
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
-                        "The client's Event channel has more than 1,000 items! If you don't need it, consider disabling the `packet-event` feature for `azalea`."
-                    )
+                        skipped,
+                        "the bounded client event channel dropped old events"
+                    );
+                    continue;
                 }
-
-                if rx.len() > 10_000 {
-                    static WARNED_10_000: AtomicBool = AtomicBool::new(false);
-                    if !WARNED_10_000.swap(true, atomic::Ordering::Relaxed) {
-                        warn!("The client's Event channel has more than 10,000 items!!")
-                    }
-
-                    if rx.len() > 100_000 {
-                        static WARNED_100_000: AtomicBool = AtomicBool::new(false);
-                        if !WARNED_100_000.swap(true, atomic::Ordering::Relaxed) {
-                            warn!("The client's Event channel has more than 100,000 items!!!")
-                        }
-
-                        if rx.len() > 1_000_000 {
-                            static WARNED_1_000_000: AtomicBool = AtomicBool::new(false);
-                            if !WARNED_1_000_000.swap(true, atomic::Ordering::Relaxed) {
-                                warn!(
-                                    "The client's Event channel has more than 1,000,000 items!!!! your code is almost certainly leaking memory"
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
 
             if let crate::Event::Disconnect(_) = event {
                 debug!(

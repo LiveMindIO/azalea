@@ -14,7 +14,7 @@ use azalea_world::WorldName;
 use bevy_app::{App, Plugin, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use derive_more::{Deref, DerefMut};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use crate::{
     chunks::ReceiveChunkEvent,
@@ -142,7 +142,15 @@ pub enum Event {
 /// The receiver for this is returned by
 /// [`Client::start_client`](crate::Client::start_client).
 #[derive(Component, Deref, DerefMut)]
-pub struct LocalPlayerEvents(pub mpsc::UnboundedSender<Event>);
+pub struct LocalPlayerEvents(pub broadcast::Sender<Event>);
+
+/// Maximum number of unread events retained for one client.
+pub const EVENT_CHANNEL_CAPACITY: usize = 1_024;
+
+/// Create the bounded channel used for one client's public event stream.
+pub fn event_channel() -> (broadcast::Sender<Event>, broadcast::Receiver<Event>) {
+    broadcast::channel(EVENT_CHANNEL_CAPACITY)
+}
 
 pub struct EventsPlugin;
 impl Plugin for EventsPlugin {
@@ -329,5 +337,23 @@ pub fn receive_chunk_listener(
                 event.packet.z,
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::*;
+
+    #[test]
+    fn event_channel_reports_bounded_retention_loss() {
+        let (sender, mut receiver) = event_channel();
+        for _ in 0..=EVENT_CHANNEL_CAPACITY {
+            sender.send(Event::Tick).unwrap();
+        }
+
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Lagged(1))));
+        assert!(matches!(receiver.try_recv(), Ok(Event::Tick)));
     }
 }

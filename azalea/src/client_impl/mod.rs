@@ -29,14 +29,14 @@ use azalea_world::{PartialWorld, World, WorldName};
 use bevy_app::{App, AppExit};
 use bevy_ecs::{entity::Entity, resource::Resource, world::Mut};
 use parking_lot::RwLock;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::{
     bot::DefaultBotPlugins,
     client_impl::error::AzaleaResult,
     entity_ref::EntityRef,
-    events::{Event, LocalPlayerEvents},
+    events::{Event, LocalPlayerEvents, event_channel},
     swarm::DefaultSwarmPlugins,
 };
 
@@ -80,14 +80,14 @@ pub struct StartClientOpts {
     pub ecs_lock: Arc<RwLock<bevy_ecs::world::World>>,
     pub account: Account,
     pub connect_opts: ConnectOpts,
-    pub event_sender: Option<mpsc::UnboundedSender<Event>>,
+    pub event_sender: Option<broadcast::Sender<Event>>,
 }
 
 impl StartClientOpts {
     pub fn new(
         account: Account,
         address: ResolvedAddr,
-        event_sender: Option<mpsc::UnboundedSender<Event>>,
+        event_sender: Option<broadcast::Sender<Event>>,
     ) -> StartClientOpts {
         Self::new_with_appexit_rx(account, address, event_sender).0
     }
@@ -95,7 +95,7 @@ impl StartClientOpts {
     pub fn new_with_appexit_rx(
         account: Account,
         address: ResolvedAddr,
-        event_sender: Option<mpsc::UnboundedSender<Event>>,
+        event_sender: Option<broadcast::Sender<Event>>,
     ) -> (StartClientOpts, oneshot::Receiver<AppExit>) {
         let mut app = App::new();
         app.add_plugins((DefaultPlugins, DefaultBotPlugins, DefaultSwarmPlugins));
@@ -185,9 +185,9 @@ impl Client {
     pub async fn join(
         account: Account,
         address: impl ResolvableAddr,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), ResolveError> {
+    ) -> Result<(Self, broadcast::Receiver<Event>), ResolveError> {
         let address = address.resolve().await?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = event_channel();
 
         let client = Self::start_client(StartClientOpts::new(account, address, Some(tx))).await;
         Ok((client, rx))
@@ -197,9 +197,9 @@ impl Client {
         account: Account,
         address: impl ResolvableAddr,
         proxy: Proxy,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>), ResolveError> {
+    ) -> Result<(Self, broadcast::Receiver<Event>), ResolveError> {
         let address = address.resolve().await?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = event_channel();
 
         let client =
             Self::start_client(StartClientOpts::new(account, address, Some(tx)).proxy(proxy)).await;
