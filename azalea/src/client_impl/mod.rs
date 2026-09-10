@@ -80,6 +80,7 @@ pub struct StartClientOpts {
     pub ecs_lock: Arc<RwLock<bevy_ecs::world::World>>,
     pub account: Account,
     pub connect_opts: ConnectOpts,
+    /// A bounded event sender created by [`crate::events::event_channel`].
     pub event_sender: Option<broadcast::Sender<Event>>,
 }
 

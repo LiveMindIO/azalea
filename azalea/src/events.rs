@@ -139,8 +139,7 @@ pub enum Event {
 /// A component that contains an event sender for events that are only
 /// received by local players.
 ///
-/// The receiver for this is returned by
-/// [`Client::start_client`](crate::Client::start_client).
+/// Create the corresponding receiver with [`event_channel`].
 #[derive(Component, Deref, DerefMut)]
 pub struct LocalPlayerEvents(pub broadcast::Sender<Event>);
 
@@ -148,6 +147,10 @@ pub struct LocalPlayerEvents(pub broadcast::Sender<Event>);
 pub const EVENT_CHANNEL_CAPACITY: usize = 1_024;
 
 /// Create the bounded channel used for one client's public event stream.
+///
+/// The channel retains the newest [`EVENT_CHANNEL_CAPACITY`] events. Receivers
+/// must handle [`broadcast::error::RecvError::Lagged`] by treating the skipped
+/// events as lost and rebuilding any derived state from the client's ECS.
 pub fn event_channel() -> (broadcast::Sender<Event>, broadcast::Receiver<Event>) {
     broadcast::channel(EVENT_CHANNEL_CAPACITY)
 }

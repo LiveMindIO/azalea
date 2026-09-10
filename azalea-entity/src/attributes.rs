@@ -75,15 +75,28 @@ impl AttributeInstance {
     }
 
     pub fn calculate(&self) -> f64 {
-        let mut total = self.base;
-        for modifier in self.modifiers_by_id.values() {
-            match modifier.operation {
-                AttributeModifierOperation::AddValue => total += modifier.amount,
-                AttributeModifierOperation::AddMultipliedBase => {
-                    total += modifier.amount * self.base
-                }
-                AttributeModifierOperation::AddMultipliedTotal => total *= 1. + modifier.amount,
-            };
+        let mut added = self.base;
+        for modifier in self
+            .modifiers_by_id
+            .values()
+            .filter(|modifier| modifier.operation == AttributeModifierOperation::AddValue)
+        {
+            added += modifier.amount;
+        }
+        let mut total = added;
+        for modifier in self
+            .modifiers_by_id
+            .values()
+            .filter(|modifier| modifier.operation == AttributeModifierOperation::AddMultipliedBase)
+        {
+            total += modifier.amount * added;
+        }
+        for modifier in self
+            .modifiers_by_id
+            .values()
+            .filter(|modifier| modifier.operation == AttributeModifierOperation::AddMultipliedTotal)
+        {
+            total *= 1. + modifier.amount;
         }
         total
     }
@@ -140,5 +153,40 @@ pub fn creative_entity_interaction_range_modifier() -> AttributeModifier {
         id: Identifier::new("creative_mode_entity_range"),
         amount: 2.0,
         operation: AttributeModifierOperation::AddValue,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn modifier(id: &str, amount: f64, operation: AttributeModifierOperation) -> AttributeModifier {
+        AttributeModifier {
+            id: Identifier::new(id),
+            amount,
+            operation,
+        }
+    }
+
+    #[test]
+    fn calculation_groups_modifier_operations() {
+        let mut attribute = AttributeInstance::new(20.0);
+        attribute.insert(modifier(
+            "multiplied_total",
+            0.5,
+            AttributeModifierOperation::AddMultipliedTotal,
+        ));
+        attribute.insert(modifier(
+            "multiplied_base",
+            0.5,
+            AttributeModifierOperation::AddMultipliedBase,
+        ));
+        attribute.insert(modifier(
+            "added",
+            10.0,
+            AttributeModifierOperation::AddValue,
+        ));
+
+        assert_eq!(attribute.calculate(), 67.5);
     }
 }
